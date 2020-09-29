@@ -10,7 +10,6 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use futures::ready;
 use hyper::server::accept::Accept;
-use hyper::server::conn::{AddrIncoming, AddrStream};
 
 use crate::transport::Transport;
 use tokio_rustls::rustls::{NoClientAuth, ServerConfig, TLSError};
@@ -178,27 +177,39 @@ impl Read for LazyFile {
     }
 }
 
-impl Transport for TlsStream {
+impl<S> Transport for TlsStream<S>
+where
+    S: Transport + Send + 'static + Unpin,
+{
     fn remote_addr(&self) -> Option<SocketAddr> {
-        Some(self.remote_addr)
+        self.remote_addr
     }
 }
 
-enum State {
-    Handshaking(tokio_rustls::Accept<AddrStream>),
-    Streaming(tokio_rustls::server::TlsStream<AddrStream>),
+enum State<S>
+where
+    S: Transport + Send + 'static + Unpin,
+{
+    Handshaking(tokio_rustls::Accept<S>),
+    Streaming(tokio_rustls::server::TlsStream<S>),
 }
 
 // tokio_rustls::server::TlsStream doesn't expose constructor methods,
 // so we have to TlsAcceptor::accept and handshake to have access to it
 // TlsStream implements AsyncRead/AsyncWrite handshaking tokio_rustls::Accept first
-pub(crate) struct TlsStream {
-    state: State,
-    remote_addr: SocketAddr,
+pub(crate) struct TlsStream<S>
+where
+    S: Transport + Send + 'static + Unpin,
+{
+    state: State<S>,
+    remote_addr: Option<SocketAddr>,
 }
 
-impl TlsStream {
-    fn new(stream: AddrStream, config: Arc<ServerConfig>) -> TlsStream {
+impl<S> TlsStream<S>
+where
+    S: Transport + Send + 'static + Unpin,
+{
+    fn new(stream: S, config: Arc<ServerConfig>) -> TlsStream<S> {
         let remote_addr = stream.remote_addr();
         let accept = tokio_rustls::TlsAcceptor::from(config).accept(stream);
         TlsStream {
@@ -208,7 +219,10 @@ impl TlsStream {
     }
 }
 
-impl AsyncRead for TlsStream {
+impl<S> AsyncRead for TlsStream<S>
+where
+    S: Transport + Send + 'static + Unpin,
+{
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context,
@@ -229,7 +243,10 @@ impl AsyncRead for TlsStream {
     }
 }
 
-impl AsyncWrite for TlsStream {
+impl<S> AsyncWrite for TlsStream<S>
+where
+    S: Transport + Send + 'static + Unpin,
+{
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -264,13 +281,19 @@ impl AsyncWrite for TlsStream {
     }
 }
 
-pub(crate) struct TlsAcceptor {
+pub(crate) struct TlsAcceptor<A>
+where
+    A: Accept + Send + Unpin,
+{
     config: Arc<ServerConfig>,
-    incoming: AddrIncoming,
+    incoming: A,
 }
 
-impl TlsAcceptor {
-    pub(crate) fn new(config: ServerConfig, incoming: AddrIncoming) -> TlsAcceptor {
+impl<A> TlsAcceptor<A>
+where
+    A: Accept + Send + Unpin,
+{
+    pub(crate) fn new(config: ServerConfig, incoming: A) -> TlsAcceptor<A> {
         TlsAcceptor {
             config: Arc::new(config),
             incoming,
@@ -278,9 +301,13 @@ impl TlsAcceptor {
     }
 }
 
-impl Accept for TlsAcceptor {
-    type Conn = TlsStream;
-    type Error = io::Error;
+impl<A> Accept for TlsAcceptor<A>
+where
+    A: Accept + Send + Unpin,
+    A::Conn: Transport + Send + Unpin + 'static,
+{
+    type Conn = TlsStream<A::Conn>;
+    type Error = A::Error;
 
     fn poll_accept(
         self: Pin<&mut Self>,

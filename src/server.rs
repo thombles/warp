@@ -511,6 +511,47 @@ where
         });
         (addr, fut)
     }
+
+    /// Setup this `TlsServer` with a specific stream of incoming connections.
+    ///
+    /// Returns a `Future` that can be executed on any runtime.
+    pub fn serve_incoming<I>(self, incoming: I) -> impl Future<Output = ()>
+    where
+        I: TryStream + Send + Unpin,
+        I::Ok: AsyncRead + AsyncWrite + Send + 'static + Unpin,
+        I::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        let incoming = incoming.map_ok(crate::transport::LiftIo);
+        self.serve_incoming2(incoming)
+            .instrument(tracing::info_span!("TlsServer::serve_incoming"))
+    }
+
+    async fn serve_incoming2<I>(self, incoming: I)
+    where
+        I: TryStream + Send + Unpin,
+        I::Ok: Transport + Send + 'static + Unpin,
+        I::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        let service = into_service!(self.server.filter);
+        let tls = match self.tls.build() {
+            Ok(tls) => tls,
+            Err(err) => {
+                tracing::error!("tls error: {}", err);
+                return;
+            }
+        };
+
+        let incoming = incoming.map_ok(crate::transport::LiftIo);
+        let incoming = hyper::server::accept::from_stream(incoming);
+        let srv = HyperServer::builder(crate::tls::TlsAcceptor::new(tls, incoming))
+            .http1_pipeline_flush(self.server.pipeline)
+            .serve(service)
+            .await;
+
+        if let Err(err) = srv {
+            tracing::error!("server error: {}", err);
+        }
+    }
 }
 
 #[cfg(feature = "tls")]
